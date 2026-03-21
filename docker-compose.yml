@@ -1,0 +1,40 @@
+services:
+  trackly-mcp:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      MCP_HTTP_PORT: "3000"
+      MCP_AUTH_MODE: ${MCP_AUTH_MODE:-apikey}
+      MCP_API_KEY: ${MCP_API_KEY:-}
+      MCP_ALLOWED_DOMAIN: ${MCP_ALLOWED_DOMAIN:-}
+      MCP_EXTERNAL_PATH: ${MCP_EXTERNAL_PATH:-}
+      MCP_CORS_ORIGIN: ${MCP_CORS_ORIGIN:-*}
+      # Trackly API
+      KANBAN_PROJECT_URL: ${KANBAN_PROJECT_URL}
+      TRACKLY_AUTH_MODE: ${TRACKLY_AUTH_MODE:-apikey-login}
+      TRACKLY_EMAIL: ${TRACKLY_EMAIL:-}
+      KANBAN_TOKEN: ${KANBAN_TOKEN:-}
+      TRACKLY_PASSWORD: ${TRACKLY_PASSWORD:-}
+      TRACKLY_API_KEY: ${TRACKLY_API_KEY:-}
+      TRACKLY_PROJECT_ID: ${TRACKLY_PROJECT_ID:-}
+      TRACKLY_WORKSPACE_ID: ${TRACKLY_WORKSPACE_ID:-}
+      # Azure Entra ID (for MCP_AUTH_MODE=oauth)
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+      # Optional tuning
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

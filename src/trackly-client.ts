@@ -1,7 +1,4 @@
-import { createLogger } from "./logger.js";
 import type { TracklyAuthMode, TracklyMcpConfig } from "./config.js";
-
-const log = createLogger("trackly-client");
 
 export interface TracklyProject {
   id: string;
@@ -81,9 +78,6 @@ export class TracklyClient {
   private readonly maxRetries: number;
   private readonly timeoutMs: number;
   private lastRequestAt = 0;
-  private currentUserId: string | null = null;
-  private currentUserEmail: string | null = null;
-  private currentUserName: string | null = null;
 
   constructor(private readonly config: TracklyMcpConfig) {
     if (!config.baseUrl) {
@@ -97,11 +91,7 @@ export class TracklyClient {
   }
 
   async whoAmI(): Promise<{ id: string; name?: string; email?: string }> {
-    const me = await this.tracklyRequest<TracklyUser>("/api/auth/me");
-    this.currentUserId = me.id;
-    this.currentUserEmail = me.email ?? null;
-    this.currentUserName = me.name ?? null;
-    return me;
+    return this.tracklyRequest<TracklyUser>("/api/auth/me");
   }
 
   async listProjects(): Promise<TracklyProject[]> {
@@ -180,9 +170,11 @@ export class TracklyClient {
     return this.mapTask(task);
   }
 
-  async updateTaskStatus(taskId: string, status: string): Promise<void> {
-    const task = await this.tracklyRequest<TracklyTaskResponse>(`/api/planner/tasks/${encodeURIComponent(taskId)}`);
-    const planId = task.planId ?? this.getPlanId();
+  async updateTaskStatus(taskId: string, status: string, planId?: string): Promise<void> {
+    if (!planId) {
+      const task = await this.tracklyRequest<TracklyTaskResponse>(`/api/planner/tasks/${encodeURIComponent(taskId)}`);
+      planId = task.planId ?? this.getPlanId();
+    }
     if (!planId) {
       throw new TracklyClientError(`Cannot update status for task "${taskId}" without a plan ID.`);
     }
@@ -192,14 +184,14 @@ export class TracklyClient {
       throw new TracklyClientError(`No bucket found for status "${status}" in plan "${planId}".`);
     }
 
-    await this.tracklyRequest<void>(`/api/planner/tasks/${encodeURIComponent(taskId)}/bucket`, {
+    await this.tracklyRequestVoid(`/api/planner/tasks/${encodeURIComponent(taskId)}/bucket`, {
       method: "PATCH",
       body: JSON.stringify({ bucketId }),
     });
   }
 
   async addComment(taskId: string, comment: string): Promise<void> {
-    await this.tracklyRequest<void>(`/api/planner/tasks/${encodeURIComponent(taskId)}/comments`, {
+    await this.tracklyRequestVoid(`/api/planner/tasks/${encodeURIComponent(taskId)}/comments`, {
       method: "POST",
       body: JSON.stringify({
         content: comment,
@@ -221,6 +213,18 @@ export class TracklyClient {
   private async tracklyRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
     const token = await this.ensureAccessToken();
     return this.requestJson<T>(`${this.baseUrl}${path}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        ...(init.headers ?? {}),
+      },
+    });
+  }
+
+  private async tracklyRequestVoid(path: string, init: RequestInit = {}): Promise<void> {
+    const token = await this.ensureAccessToken();
+    await this.requestVoid(`${this.baseUrl}${path}`, {
       ...init,
       headers: {
         Authorization: `Bearer ${token}`,
@@ -353,10 +357,11 @@ export class TracklyClient {
 
   private async requestJson<T>(url: string, init: RequestInit = {}, allowRetry = true): Promise<T> {
     const response = await this.request(url, init, allowRetry);
-    if (response.status === 204) {
-      return undefined as T;
-    }
     return (await response.json()) as T;
+  }
+
+  private async requestVoid(url: string, init: RequestInit = {}, allowRetry = true): Promise<void> {
+    await this.request(url, init, allowRetry);
   }
 
   private async request(url: string, init: RequestInit = {}, allowRetry = true): Promise<Response> {

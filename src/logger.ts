@@ -26,16 +26,9 @@ export function createLogger(module: string) {
       ...(meta ? { meta } : {}),
     };
 
+    // All output goes to stderr — stdout is reserved for MCP stdio transport.
     const line = JSON.stringify(payload);
-    if (level === "error") {
-      console.error(line);
-      return;
-    }
-    if (level === "warn") {
-      console.warn(line);
-      return;
-    }
-    console.log(line);
+    console.error(line);
   }
 
   return {

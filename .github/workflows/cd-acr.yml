@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Azure login
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -42,26 +42,29 @@ jobs:
       - name: Log in to Azure Container Registry
         run: az acr login --name ${{ env.REGISTRY_NAME }}
 
-      - name: Extract version tag
+      - name: Extract image tags
         id: meta
         run: |
-          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
             TAGS="$TAGS,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}"
           fi
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Build Docker image locally
         run: |
           docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest .
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
             docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}
           fi
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           format: table
@@ -72,6 +75,7 @@ jobs:
       - name: Push Docker image
         run: |
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.short_sha }}
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
             docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}

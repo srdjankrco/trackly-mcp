@@ -158,6 +158,7 @@ The gateway provides:
 - **OAuth well-known endpoints**: RFC 9728 / 8414 compliant metadata discovery
 
 Images are pushed to `dunavnet.azurecr.io/mcp/trackly-mcp` via the CD pipeline or manually with `scripts/push-to-acr.ps1` from the GrantAgent repo.
+Each push to `main` now publishes both `latest` and a 7-character commit SHA tag. The shared Azure App Service currently follows `latest`; the SHA tags are available for safer pinned rollouts once the shared gateway deployment is updated to consume immutable image references.
 
 ## Development
 

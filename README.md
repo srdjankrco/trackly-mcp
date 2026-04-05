@@ -160,6 +160,18 @@ The gateway provides:
 Images are pushed to `dunavnet.azurecr.io/mcp/trackly-mcp` via the CD pipeline when it is run manually from GitHub Actions, or manually with `scripts/push-to-acr.ps1` from the GrantAgent repo.
 Each manual CD run publishes both `latest` and a 7-character commit SHA tag. The shared Azure App Service currently follows `latest`; the SHA tags are available for safer pinned rollouts once the shared gateway deployment is updated to consume immutable image references.
 
+### Manual Publish
+
+To publish from GitHub Actions, open the repository's **Actions** tab, select **CD — Push to ACR**, click **Run workflow**, and choose the branch or tag you want to publish.
+
+To publish from the command line with GitHub CLI:
+
+```bash
+gh workflow run "CD — Push to ACR" --ref main
+```
+
+To publish a release tag instead of `main`, replace `main` with the tag ref you want to build, for example `--ref v0.1.0`.
+
 ## Development
 
 ```bash

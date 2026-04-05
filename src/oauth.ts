@@ -19,6 +19,8 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomBytes, createHash } from 'node:crypto';
 import { URL } from 'node:url';
+import { bufferRequestBody, parsePositiveIntegerEnv, RequestBodyTooLargeError } from './http-utils.js';
+import { createLogger } from './logger.js';
 
 /* ------------------------------------------------------------------ */
 /*  Configuration                                                      */
@@ -29,6 +31,15 @@ interface OAuthConfig {
   clientId: string;
   clientSecret: string;
 }
+
+const DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024;
+const PENDING_AUTH_TTL_MS = 10 * 60 * 1000;
+const MAX_PENDING_AUTHS = 1000;
+const REGISTERED_CLIENT_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_REGISTERED_CLIENTS = 1000;
+const LOOPBACK_PORT_MIN = 1024;
+const LOOPBACK_PORT_MAX = 65535;
+const logger = createLogger('oauth');
 
 function getConfig(): OAuthConfig {
   const tenantId = process.env.AZURE_TENANT_ID ?? '';
@@ -91,7 +102,7 @@ export async function validateAccessToken(token: string): Promise<boolean> {
 /** Dynamically registered OAuth clients (RFC 7591). */
 const clients = new Map<
   string,
-  { redirect_uris: string[]; client_name?: string; token_endpoint_auth_method: string }
+  { redirect_uris: string[]; client_name?: string; token_endpoint_auth_method: string; expiresAt: number }
 >();
 
 /** Pending authorization requests awaiting Azure Entra ID callback. */
@@ -103,6 +114,7 @@ const pendingAuths = new Map<
     codeChallenge: string;
     codeChallengeMethod: string;
     state: string;
+    expiresAt: number;
   }
 >();
 
@@ -125,18 +137,20 @@ const authCodes = new Map<
 
 function sweepExpired(): void {
   const now = Date.now();
+  for (const [key, entry] of clients) {
+    if (entry.expiresAt < now) clients.delete(key);
+  }
   for (const [key, entry] of authCodes) {
     if (entry.expiresAt < now) authCodes.delete(key);
   }
-  // pendingAuths don't carry expiresAt — use a simple size cap.
-  // In practice the /callback handler deletes them; this catches abandoned flows.
-  if (pendingAuths.size > 1000) {
-    pendingAuths.clear();
+  for (const [key, entry] of pendingAuths) {
+    if (entry.expiresAt < now) pendingAuths.delete(key);
   }
 }
 
-// Run every 5 minutes.
-setInterval(sweepExpired, 5 * 60 * 1000).unref();
+// Run TTL sweep at a configurable interval (default: every 5 minutes).
+const SWEEP_INTERVAL_MS = parseInt(process.env.OAUTH_CACHE_SWEEP_INTERVAL_MS || String(5 * 60 * 1000), 10);
+setInterval(sweepExpired, SWEEP_INTERVAL_MS).unref();
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -150,12 +164,12 @@ function getBaseUrl(req: IncomingMessage): string {
 }
 
 function bufferBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+  const maxRequestBytes = parsePositiveIntegerEnv(
+    process.env.MCP_MAX_REQUEST_BYTES,
+    'MCP_MAX_REQUEST_BYTES',
+    DEFAULT_MAX_REQUEST_BYTES,
+  );
+  return bufferRequestBody(req, maxRequestBytes);
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -171,6 +185,15 @@ function verifyPKCE(verifier: string, challenge: string, method: string): boolea
   return false; // Only S256 is accepted per OAuth 2.1
 }
 
+function isValidRegistrationRedirectUri(uri: string): boolean {
+  try {
+    const parsed = new URL(uri);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /*  Route handler — returns true if the path was an OAuth endpoint     */
 /* ------------------------------------------------------------------ */
@@ -184,54 +207,62 @@ export async function handleOAuthRoute(
   res: ServerResponse,
   pathname: string,
 ): Promise<boolean> {
-  // Protected Resource Metadata (RFC 9728)
-  if (pathname === '/.well-known/oauth-protected-resource') {
-    const baseUrl = getBaseUrl(req);
-    sendJson(res, 200, {
-      resource: `${baseUrl}/mcp`,
-      authorization_servers: [baseUrl],
-      bearer_methods_supported: ['header'],
-    });
-    return true;
-  }
+  try {
+    // Protected Resource Metadata (RFC 9728)
+    if (pathname === '/.well-known/oauth-protected-resource') {
+      const baseUrl = getBaseUrl(req);
+      sendJson(res, 200, {
+        resource: `${baseUrl}/mcp`,
+        authorization_servers: [baseUrl],
+        bearer_methods_supported: ['header'],
+      });
+      return true;
+    }
 
-  // Authorization Server Metadata (RFC 8414)
-  if (pathname === '/.well-known/oauth-authorization-server') {
-    const baseUrl = getBaseUrl(req);
-    sendJson(res, 200, {
-      issuer: baseUrl,
-      authorization_endpoint: `${baseUrl}/authorize`,
-      token_endpoint: `${baseUrl}/token`,
-      registration_endpoint: `${baseUrl}/register`,
-      response_types_supported: ['code'],
-      grant_types_supported: ['authorization_code', 'refresh_token'],
-      token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
-      code_challenge_methods_supported: ['S256'],
-    });
-    return true;
-  }
+    // Authorization Server Metadata (RFC 8414)
+    if (pathname === '/.well-known/oauth-authorization-server') {
+      const baseUrl = getBaseUrl(req);
+      sendJson(res, 200, {
+        issuer: baseUrl,
+        authorization_endpoint: `${baseUrl}/authorize`,
+        token_endpoint: `${baseUrl}/token`,
+        registration_endpoint: `${baseUrl}/register`,
+        response_types_supported: ['code'],
+        grant_types_supported: ['authorization_code', 'refresh_token'],
+        token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
+        code_challenge_methods_supported: ['S256'],
+      });
+      return true;
+    }
 
-  // Dynamic Client Registration (RFC 7591)
-  if (pathname === '/register' && req.method === 'POST') {
-    return handleRegister(req, res);
-  }
+    // Dynamic Client Registration (RFC 7591)
+    if (pathname === '/register' && req.method === 'POST') {
+      return handleRegister(req, res);
+    }
 
-  // Authorization endpoint
-  if (pathname === '/authorize' && req.method === 'GET') {
-    return handleAuthorize(req, res);
-  }
+    // Authorization endpoint
+    if (pathname === '/authorize' && req.method === 'GET') {
+      return handleAuthorize(req, res);
+    }
 
-  // Azure Entra ID callback
-  if (pathname === '/callback' && req.method === 'GET') {
-    return handleCallback(req, res);
-  }
+    // Azure Entra ID callback
+    if (pathname === '/callback' && req.method === 'GET') {
+      return handleCallback(req, res);
+    }
 
-  // Token endpoint
-  if (pathname === '/token' && req.method === 'POST') {
-    return handleToken(req, res);
-  }
+    // Token endpoint
+    if (pathname === '/token' && req.method === 'POST') {
+      return handleToken(req, res);
+    }
 
-  return false;
+    return false;
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      sendJson(res, 413, { error: 'payload_too_large' });
+      return true;
+    }
+    throw error;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -239,6 +270,16 @@ export async function handleOAuthRoute(
 /* ------------------------------------------------------------------ */
 
 async function handleRegister(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  sweepExpired();
+
+  if (clients.size >= MAX_REGISTERED_CLIENTS) {
+    sendJson(res, 503, {
+      error: 'temporarily_unavailable',
+      error_description: 'Too many registered OAuth clients. Please try again later.',
+    });
+    return true;
+  }
+
   const body = await bufferBody(req);
   let data: Record<string, unknown>;
   try {
@@ -250,6 +291,14 @@ async function handleRegister(req: IncomingMessage, res: ServerResponse): Promis
 
   const clientId = randomBytes(16).toString('hex');
   const redirectUris = Array.isArray(data.redirect_uris) ? (data.redirect_uris as string[]) : [];
+  if (redirectUris.length === 0 || redirectUris.some((uri) => !isValidRegistrationRedirectUri(uri))) {
+    sendJson(res, 400, {
+      error: 'invalid_client_metadata',
+      error_description: 'redirect_uris must contain valid http or https URLs.',
+    });
+    return true;
+  }
+
   const authMethod =
     typeof data.token_endpoint_auth_method === 'string'
       ? data.token_endpoint_auth_method
@@ -259,6 +308,7 @@ async function handleRegister(req: IncomingMessage, res: ServerResponse): Promis
     redirect_uris: redirectUris,
     client_name: typeof data.client_name === 'string' ? data.client_name : undefined,
     token_endpoint_auth_method: authMethod,
+    expiresAt: Date.now() + REGISTERED_CLIENT_TTL_MS,
   });
 
   sendJson(res, 201, {
@@ -290,8 +340,12 @@ async function handleRegister(req: IncomingMessage, res: ServerResponse): Promis
 function isTrustedPublicClientUri(uri: string): boolean {
   try {
     const u = new URL(uri);
-    // VS Code loopback (any port)
-    if (u.protocol === 'http:' && u.hostname === '127.0.0.1') return true;
+    // VS Code loopback: http on 127.0.0.1 with an ephemeral port (>= 1024)
+    if (u.protocol === 'http:' && u.hostname === '127.0.0.1') {
+      const port = parseInt(u.port, 10);
+      const inRange = !isNaN(port) && port >= LOOPBACK_PORT_MIN && port <= LOOPBACK_PORT_MAX;
+      return inRange;
+    }
     // VS Code remote / web redirect
     if (uri === 'https://vscode.dev/redirect') return true;
     return false;
@@ -305,6 +359,7 @@ function isTrustedPublicClientUri(uri: string): boolean {
 /* ------------------------------------------------------------------ */
 
 async function handleAuthorize(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  sweepExpired();
   const url = new URL(req.url || '/', `http://${req.headers.host}`);
   const clientId = url.searchParams.get('client_id');
   const redirectUri = url.searchParams.get('redirect_uri');
@@ -325,10 +380,19 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse): Promi
     // accept any public client whose redirect_uri is a trusted VS Code URI.
     // The redirect_uri check is the security gate for public clients under OAuth 2.1.
     if (isTrustedPublicClientUri(redirectUri)) {
+      if (clients.size >= MAX_REGISTERED_CLIENTS) {
+        sendJson(res, 503, {
+          error: 'temporarily_unavailable',
+          error_description: 'Too many registered OAuth clients. Please try again later.',
+        });
+        return true;
+      }
+
       clients.set(clientId, {
         redirect_uris: [redirectUri],
         client_name: 'VS Code (auto-restored)',
         token_endpoint_auth_method: 'none',
+        expiresAt: Date.now() + REGISTERED_CLIENT_TTL_MS,
       });
     } else {
       sendJson(res, 400, { error: 'invalid_client' });
@@ -343,6 +407,7 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse): Promi
     // (e.g. VS Code rotated the loopback port).
     if (isTrustedPublicClientUri(redirectUri)) {
       registeredClient.redirect_uris.push(redirectUri);
+      registeredClient.expiresAt = Date.now() + REGISTERED_CLIENT_TTL_MS;
     } else {
       sendJson(res, 400, { error: 'redirect_uri_mismatch' });
       return true;
@@ -352,6 +417,14 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse): Promi
   const config = getConfig();
   const baseUrl = getBaseUrl(req);
 
+  if (pendingAuths.size >= MAX_PENDING_AUTHS) {
+    sendJson(res, 503, {
+      error: 'temporarily_unavailable',
+      error_description: 'Too many pending authorization requests. Please try again shortly.',
+    });
+    return true;
+  }
+
   // Store pending authorization keyed by a server-side state parameter
   const serverState = randomBytes(16).toString('hex');
   pendingAuths.set(serverState, {
@@ -360,6 +433,7 @@ async function handleAuthorize(req: IncomingMessage, res: ServerResponse): Promi
     codeChallenge,
     codeChallengeMethod,
     state,
+    expiresAt: Date.now() + PENDING_AUTH_TTL_MS,
   });
 
   // Redirect user's browser to Azure Entra ID
@@ -410,6 +484,13 @@ async function handleCallback(req: IncomingMessage, res: ServerResponse): Promis
 
   const pending = pendingAuths.get(serverState)!;
   pendingAuths.delete(serverState);
+  if (pending.expiresAt < Date.now()) {
+    sendJson(res, 400, {
+      error: 'invalid_request',
+      error_description: 'Authorization request expired. Please try again.',
+    });
+    return true;
+  }
 
   const config = getConfig();
   const baseUrl = getBaseUrl(req);
@@ -431,7 +512,7 @@ async function handleCallback(req: IncomingMessage, res: ServerResponse): Promis
   );
 
   if (!tokenResponse.ok) {
-    console.error('Azure token exchange failed:', await tokenResponse.text());
+    logger.error('Azure token exchange failed', { status: tokenResponse.status, body: await tokenResponse.text() });
     sendJson(res, 502, { error: 'upstream_token_exchange_failed' });
     return true;
   }

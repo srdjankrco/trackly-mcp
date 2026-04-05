@@ -19,14 +19,16 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts
 
-COPY --from=builder /app/dist ./dist
+COPY --from=builder --chown=node:node /app/dist ./dist
+RUN chown -R node:node /app
+
+USER node
 
 ENV NODE_ENV=production
-ENV MCP_HTTP_PORT=3000
 
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
-  CMD node -e "fetch('http://localhost:3000/health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"
+  CMD sh -c 'PORT="${MCP_HTTP_PORT:-3000}" node -e "fetch(\"http://localhost:\" + process.env.PORT + \"/health\").then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"'
 
 ENTRYPOINT ["node", "dist/mcp-server.js"]

@@ -1,17 +1,23 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import packageInfo from "../package.json" with { type: "json" };
 import { loadConfig, validateConfig } from "./config.js";
-import { TracklyClient } from "./trackly-client.js";
-import { startServer } from "./transport.js";
+import { TracklyClient, TracklyClientError } from "./trackly-client.js";
+import { createLogger } from "./logger.js";
+import { startServer, validateStartup } from "./transport.js";
+
+const logger = createLogger("mcp-server");
 
 function ok(text: string) {
   return { content: [{ type: "text" as const, text }] };
 }
 
-function fail(error: unknown) {
+function fail(error: unknown): { content: [{ type: "text"; text: string }]; isError: true } {
   const message = error instanceof Error ? error.message : String(error);
+  const code = error instanceof TracklyClientError && error.status ? String(error.status) : 'ERR';
+  const requestUrl = error instanceof TracklyClientError ? error.requestUrl : undefined;
   return {
-    content: [{ type: "text" as const, text: message }],
+    content: [{ type: "text" as const, text: requestUrl ? `[${code}] ${message}\nURL: ${requestUrl}` : `[${code}] ${message}` }],
     isError: true,
   };
 }
@@ -23,7 +29,7 @@ function howtoText(): string {
     "Tools:",
     "- whoami",
     "- list_projects",
-    "- list_tasks(plan_id?, status?, assignee?, mine_only?, completed_in_last_days?)",
+    "- list_tasks(plan_id?, status?, assignee?, mine_only?, completed_in_last_days?)  plan_id accepts a project title or plan ID",
     "- get_task(task_id)",
     "- create_task(title, description?, plan_id?, status?, priority?)",
     "- update_task_status(task_id, status, plan_id?)",
@@ -49,7 +55,7 @@ function howtoText(): string {
 function createTracklyServer(): McpServer {
   const server = new McpServer({
     name: "trackly-mcp",
-    version: "0.1.0",
+    version: packageInfo.version,
   });
 
   const cfg = loadConfig();
@@ -67,18 +73,32 @@ function createTracklyServer(): McpServer {
     }
   });
 
-  server.tool("list_projects", "List Trackly projects/plans available to the current user.", {}, async () => {
-    try {
-      const projects = await client.listProjects();
-      return ok(JSON.stringify(projects, null, 2));
-    } catch (error) {
-      return fail(error);
-    }
-  });
+  server.tool(
+    "list_projects",
+    `List Trackly projects/plans available to the current user.
+
+Example: list_projects({})`,
+    {},
+    async () => {
+      try {
+        const projects = await client.listProjects();
+        return ok(JSON.stringify(projects, null, 2));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
 
   server.tool(
     "list_tasks",
-    "List Trackly tasks, optionally filtered by plan, status, assignee, or mine-only.",
+    `List Trackly tasks, optionally filtered by plan, status, assignee, or mine-only.
+
+Examples:
+  list_tasks({})                                        all tasks
+  list_tasks({ plan_id: "My Project" })                 filter by project
+  list_tasks({ status: "In Progress" })                 filter by status
+  list_tasks({ mine_only: true })                        tasks assigned to me
+  list_tasks({ plan_id: "Sprint 5", status: "Done", completed_in_last_days: 7 })`,
     {
       plan_id: z.string().optional().describe("Trackly project title or plan ID."),
       status: z.string().optional().describe("Bucket/status name to filter by."),
@@ -88,6 +108,10 @@ function createTracklyServer(): McpServer {
     },
     async ({ plan_id, status, assignee, mine_only, completed_in_last_days }) => {
       try {
+        if (mine_only && assignee) {
+          return fail(new Error("Specify either mine_only=true or assignee, not both."));
+        }
+
         const tasks = await client.listTasks({
           planId: plan_id,
           status,
@@ -103,7 +127,9 @@ function createTracklyServer(): McpServer {
 
   server.tool(
     "get_task",
-    "Get full details for a Trackly task by ID.",
+    `Get full details for a Trackly task by ID.
+
+Example: get_task({ task_id: "ABC-123" })`,
     {
       task_id: z.string().describe("Trackly task/card ID."),
     },
@@ -119,7 +145,11 @@ function createTracklyServer(): McpServer {
 
   server.tool(
     "create_task",
-    "Create a Trackly task in a project/plan.",
+    `Create a Trackly task in a project/plan.
+
+Examples:
+  create_task({ title: "Fix login bug", plan_id: "Backend" })
+  create_task({ title: "Review PR", description: "Review and approve #42", status: "In Review", priority: 2 })`,
     {
       title: z.string().describe("Task title."),
       description: z.string().optional().describe("Task description."),
@@ -136,7 +166,7 @@ function createTracklyServer(): McpServer {
           status,
           priority,
         });
-        return ok(JSON.stringify(task, null, 2));
+        return ok(`Created task ${task.id} \"${task.title}\" in plan \"${task.planId}\".\n\n${JSON.stringify(task, null, 2)}`);
       } catch (error) {
         return fail(error);
       }
@@ -145,7 +175,11 @@ function createTracklyServer(): McpServer {
 
   server.tool(
     "update_task_status",
-    "Move a Trackly task to another bucket/status.",
+    `Move a Trackly task to another bucket/status.
+
+Examples:
+  update_task_status({ task_id: "ABC-123", status: "In Progress" })
+  update_task_status({ task_id: "ABC-123", status: "Done", plan_id: "Sprint 5" })`,
     {
       task_id: z.string().describe("Trackly task/card ID."),
       status: z.string().describe("Target Trackly bucket/status name."),
@@ -163,7 +197,9 @@ function createTracklyServer(): McpServer {
 
   server.tool(
     "add_comment",
-    "Add a comment to a Trackly task.",
+    `Add a comment to a Trackly task.
+
+Example: add_comment({ task_id: "ABC-123", comment: "Looks good, approved!" })`,
     {
       task_id: z.string().describe("Trackly task/card ID."),
       comment: z.string().describe("Comment text."),
@@ -180,7 +216,9 @@ function createTracklyServer(): McpServer {
 
   server.tool(
     "list_comments",
-    "List comments on a Trackly task.",
+    `List comments on a Trackly task.
+
+Example: list_comments({ task_id: "ABC-123" })`,
     {
       task_id: z.string().describe("Trackly task/card ID."),
     },
@@ -198,10 +236,23 @@ function createTracklyServer(): McpServer {
 }
 
 async function main(): Promise<void> {
+  // Validate environment before doing anything else.
+  const { valid, errors, warnings } = validateStartup();
+  for (const warning of warnings) {
+    logger.warn('Startup warning', { warning });
+  }
+  if (!valid) {
+    for (const error of errors) {
+      logger.error('Startup error', { error });
+    }
+    process.exit(1);
+  }
+
+  // Trackly config (baseUrl, auth) is loaded and validated inside createTracklyServer -> createTracklyClient.
   await startServer(createTracklyServer, "trackly-mcp");
 }
 
 main().catch((error) => {
-  console.error(`[trackly-mcp] fatal:`, error);
+  logger.error('Fatal startup error', { error: error instanceof Error ? error.stack ?? error.message : String(error) });
   process.exit(1);
 });

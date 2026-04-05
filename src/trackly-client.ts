@@ -1,5 +1,21 @@
 import type { TracklyAuthMode, TracklyMcpConfig } from "./config.js";
 
+/* ------------------------------------------------------------------ */
+/*  Input sanitization                                                   */
+/* ------------------------------------------------------------------ */
+
+const MAX_STRING_LENGTH = 10_000;
+const CONTROL_CHAR_REGEX = /[\x00-\x1F\x7F]/g;
+const LOOKUP_CACHE_TTL_MS = 60_000;
+
+function sanitizeString(input: unknown): string {
+  if (typeof input !== 'string') return '';
+  return input
+    .replace(CONTROL_CHAR_REGEX, '')
+    .trim()
+    .slice(0, MAX_STRING_LENGTH);
+}
+
 export interface TracklyProject {
   id: string;
   title: string;
@@ -61,13 +77,20 @@ interface TracklyCommentResponse {
   createdAt?: string;
 }
 
+interface CacheEntry<T> {
+  value: T;
+  expiresAt: number;
+}
+
 export class TracklyClientError extends Error {
   public readonly status?: number;
+  public readonly requestUrl?: string;
 
-  constructor(message: string, status?: number) {
+  constructor(message: string, status?: number, requestUrl?: string) {
     super(message);
     this.name = "TracklyClientError";
     this.status = status;
+    this.requestUrl = requestUrl;
   }
 }
 
@@ -78,6 +101,10 @@ export class TracklyClient {
   private readonly maxRetries: number;
   private readonly timeoutMs: number;
   private lastRequestAt = 0;
+  private projectCache: CacheEntry<TracklyProject[]> | null = null;
+  private organizationUsersCache: CacheEntry<TracklyUser[]> | null = null;
+  private whoAmICache: CacheEntry<TracklyUser> | null = null;
+  private readonly bucketCache = new Map<string, CacheEntry<TracklyBucket[]>>();
 
   constructor(private readonly config: TracklyMcpConfig) {
     if (!config.baseUrl) {
@@ -91,12 +118,26 @@ export class TracklyClient {
   }
 
   async whoAmI(): Promise<{ id: string; name?: string; email?: string }> {
-    return this.tracklyRequest<TracklyUser>("/api/auth/me");
+    const cached = this.getCachedValue(this.whoAmICache);
+    if (cached) {
+      return cached;
+    }
+
+    const me = await this.tracklyRequest<TracklyUser>("/api/auth/me");
+    this.whoAmICache = this.makeCacheEntry(me);
+    return me;
   }
 
   async listProjects(): Promise<TracklyProject[]> {
+    const cached = this.getCachedValue(this.projectCache);
+    if (cached) {
+      return cached;
+    }
+
     const plans = await this.tracklyRequest<Array<{ id: string; title: string }>>("/api/planner/plans");
-    return plans.map((plan) => ({ id: plan.id, title: plan.title }));
+    const projects = plans.map((plan) => ({ id: plan.id, title: plan.title }));
+    this.projectCache = this.makeCacheEntry(projects);
+    return projects;
   }
 
   async listTasks(filters: {
@@ -147,8 +188,8 @@ export class TracklyClient {
     }
 
     const payload: Record<string, unknown> = {
-      title: input.title,
-      description: input.description ?? "",
+      title: sanitizeString(input.title),
+      description: sanitizeString(input.description ?? ""),
       planId,
     };
 
@@ -194,7 +235,7 @@ export class TracklyClient {
     await this.tracklyRequestVoid(`/api/planner/tasks/${encodeURIComponent(taskId)}/comments`, {
       method: "POST",
       body: JSON.stringify({
-        content: comment,
+        content: sanitizeString(comment),
         contentType: "text",
       }),
     });
@@ -239,10 +280,7 @@ export class TracklyClient {
       return this.accessToken;
     }
 
-    let authMode: TracklyAuthMode = this.config.authMode ?? "bearer";
-    if (authMode === "bearer" && this.config.apiKey && this.config.email) {
-      authMode = "apikey-login";
-    }
+    const authMode: TracklyAuthMode = this.config.authMode ?? "bearer";
 
     if (authMode === "bearer") {
       throw new TracklyClientError("Trackly bearer mode requires KANBAN_TOKEN.");
@@ -265,6 +303,7 @@ export class TracklyClient {
         }),
       });
       this.accessToken = login.token;
+      this.clearLookupCaches();
       return login.token;
     }
 
@@ -281,6 +320,7 @@ export class TracklyClient {
       body: JSON.stringify({ email: this.config.email }),
     });
     this.accessToken = login.token;
+    this.clearLookupCaches();
     return login.token;
   }
 
@@ -295,9 +335,7 @@ export class TracklyClient {
   }
 
   private async resolveBucketIdByStatus(planId: string, status: string): Promise<string | null> {
-    const buckets = await this.tracklyRequest<TracklyBucket[]>(
-      `/api/planner/buckets?planId=${encodeURIComponent(planId)}`,
-    );
+    const buckets = await this.getBuckets(planId);
     const normalizedTarget = normalizeStatus(status);
     const matched = buckets.find((bucket) => normalizeStatus(bucket.name) === normalizedTarget);
     return matched?.id ?? null;
@@ -309,7 +347,7 @@ export class TracklyClient {
       return assignee;
     }
 
-    const users = await this.tracklyRequest<TracklyUser[]>("/api/auth/organization-users");
+    const users = await this.getOrganizationUsers();
     const normalized = assignee.toLowerCase();
     const matched = users.find((user) => {
       const email = user.email?.toLowerCase();
@@ -357,7 +395,15 @@ export class TracklyClient {
 
   private async requestJson<T>(url: string, init: RequestInit = {}, allowRetry = true): Promise<T> {
     const response = await this.request(url, init, allowRetry);
-    return (await response.json()) as T;
+    const text = await response.text();
+    if (!text) {
+      throw new TracklyClientError(`Empty response body from ${url}`, response.status, url);
+    }
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new TracklyClientError(`Invalid JSON response from ${url}: ${text.slice(0, 200)}`, response.status, url);
+    }
   }
 
   private async requestVoid(url: string, init: RequestInit = {}, allowRetry = true): Promise<void> {
@@ -381,12 +427,19 @@ export class TracklyClient {
         return response;
       }
 
-      if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-        throw new TracklyClientError(`Request failed with status ${response.status} for ${url}`, response.status);
+      // Only retry on transient failures: 5xx, 429 (rate limit), or network errors.
+      // Permanent failures (4xx except 429) are thrown immediately.
+      const isRetryable =
+        response.status === 429 ||
+        response.status >= 500 ||
+        response.status === 0; // network error (e.g. DNS, timeout)
+
+      if (!isRetryable) {
+        throw new TracklyClientError(`Request failed with status ${response.status} for ${url}`, response.status, url);
       }
 
       if (!allowRetry) {
-        throw new TracklyClientError(`Request failed after retries with status ${response.status} for ${url}`, response.status);
+        throw new TracklyClientError(`Request failed after retries with status ${response.status} for ${url}`, response.status, url);
       }
 
       return this.requestWithRetry(url, init, response.status);
@@ -395,7 +448,7 @@ export class TracklyClient {
         throw error;
       }
       if (!allowRetry) {
-        throw new TracklyClientError(`Request failed for ${url}: ${String(error)}`);
+        throw new TracklyClientError(`Request failed for ${url}: ${String(error)}`, undefined, url);
       }
       return this.requestWithRetry(url, init);
     } finally {
@@ -416,7 +469,9 @@ export class TracklyClient {
 
   private getBackoffMs(attempt: number, status?: number): number {
     const base = status === 429 ? 500 : 300;
-    return base * Math.pow(2, attempt - 1);
+    const exponential = base * Math.pow(2, attempt - 1);
+    const jitter = Math.random() * 0.3 * exponential; // 0–30% jitter to prevent thundering herd
+    return Math.floor(exponential + jitter);
   }
 
   private async applyRateLimit(): Promise<void> {
@@ -432,6 +487,57 @@ export class TracklyClient {
 
   private async sleep(ms: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private makeCacheEntry<T>(value: T): CacheEntry<T> {
+    return {
+      value,
+      expiresAt: Date.now() + LOOKUP_CACHE_TTL_MS,
+    };
+  }
+
+  private getCachedValue<T>(entry: CacheEntry<T> | null): T | null {
+    if (!entry) {
+      return null;
+    }
+
+    if (entry.expiresAt <= Date.now()) {
+      return null;
+    }
+
+    return entry.value;
+  }
+
+  private clearLookupCaches(): void {
+    this.projectCache = null;
+    this.organizationUsersCache = null;
+    this.whoAmICache = null;
+    this.bucketCache.clear();
+  }
+
+  private async getBuckets(planId: string): Promise<TracklyBucket[]> {
+    const cached = this.bucketCache.get(planId);
+    const cachedBuckets = cached && this.getCachedValue(cached);
+    if (cachedBuckets) {
+      return cachedBuckets;
+    }
+
+    const buckets = await this.tracklyRequest<TracklyBucket[]>(
+      `/api/planner/buckets?planId=${encodeURIComponent(planId)}`,
+    );
+    this.bucketCache.set(planId, this.makeCacheEntry(buckets));
+    return buckets;
+  }
+
+  private async getOrganizationUsers(): Promise<TracklyUser[]> {
+    const cached = this.getCachedValue(this.organizationUsersCache);
+    if (cached) {
+      return cached;
+    }
+
+    const users = await this.tracklyRequest<TracklyUser[]>("/api/auth/organization-users");
+    this.organizationUsersCache = this.makeCacheEntry(users);
+    return users;
   }
 }
 

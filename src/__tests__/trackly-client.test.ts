@@ -42,6 +42,18 @@ describe("TracklyClient", () => {
       const result = await client.whoAmI();
       expect(result).toEqual(user);
     });
+
+    it("caches whoAmI responses briefly", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        jsonResponse({ id: "u1", name: "Test", email: "test@example.com" }),
+      );
+
+      const client = new TracklyClient(makeConfig());
+      await client.whoAmI();
+      await client.whoAmI();
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("listProjects", () => {
@@ -58,6 +70,18 @@ describe("TracklyClient", () => {
         { id: "p1", title: "Project 1" },
         { id: "p2", title: "Project 2" },
       ]);
+    });
+
+    it("caches project lookups briefly", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        jsonResponse([{ id: "p1", title: "Project 1" }]),
+      );
+
+      const client = new TracklyClient(makeConfig());
+      await client.listProjects();
+      await client.listProjects();
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -159,16 +183,16 @@ describe("TracklyClient", () => {
   });
 
   describe("error handling", () => {
-    it("throws TracklyClientError on 4xx", async () => {
+    it("throws TracklyClientError on 4xx (permanent failure, no retry)", async () => {
       vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
         new Response("Not Found", { status: 404 }),
       );
 
-      const client = new TracklyClient(makeConfig());
+      const client = new TracklyClient(makeConfig({ maxRetries: 3 }));
       await expect(client.getTask("missing")).rejects.toThrow(TracklyClientError);
     });
 
-    it("retries on 5xx", async () => {
+    it("retries on 5xx (transient failure)", async () => {
       const fetchSpy = vi.spyOn(globalThis, "fetch")
         .mockResolvedValueOnce(new Response("Error", { status: 500 }))
         .mockResolvedValueOnce(jsonResponse({ id: "t1", title: "T", planId: "p1" }));
@@ -177,6 +201,69 @@ describe("TracklyClient", () => {
       const task = await client.getTask("t1");
       expect(task.id).toBe("t1");
       expect(fetchSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not retry on 4xx client errors (except 429)", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response("Bad Request", { status: 400 }));
+
+      const client = new TracklyClient(makeConfig({ maxRetries: 3 }));
+      await expect(client.getTask("bad")).rejects.toThrow(TracklyClientError);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("throws on invalid JSON response", async () => {
+      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response("not json", { status: 200, headers: { "Content-Type": "application/json" } }),
+      );
+
+      const client = new TracklyClient(makeConfig());
+      await expect(client.getTask("t1")).rejects.toThrow("Invalid JSON response");
+    });
+
+    it("throws on empty JSON body", async () => {
+      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response("", { status: 200, headers: { "Content-Type": "application/json" } }),
+      );
+
+      const client = new TracklyClient(makeConfig());
+      await expect(client.whoAmI()).rejects.toThrow("Empty response body");
+    });
+  });
+
+  describe("input sanitization", () => {
+    it("strips control characters from task title", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+      const client = new TracklyClient(makeConfig());
+      // Tab, newline, and null char should be stripped
+      await client.addComment("t1", "Hello\x00World\nTest\tEnd");
+      const body = JSON.parse(fetchSpy.mock.calls[0]?.[1]?.body as string);
+      expect(body.content).toBe("HelloWorldTestEnd");
+    });
+
+    it("truncates strings longer than 10,000 characters", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+      const client = new TracklyClient(makeConfig());
+      const longComment = "x".repeat(15_000);
+      await client.addComment("t1", longComment);
+      const body = JSON.parse(fetchSpy.mock.calls[0]?.[1]?.body as string);
+      expect(body.content.length).toBe(10_000);
+    });
+
+    it("handles non-string input gracefully", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(jsonResponse({ id: "t1", title: "", description: "", planId: "p1" }));
+
+      const client = new TracklyClient(makeConfig({ projectId: "p1" }));
+      // @ts-expect-error intentionally passing non-string to test sanitization
+      await client.createTask({ title: null, description: undefined });
+      const body = JSON.parse(fetchSpy.mock.calls[0]?.[1]?.body as string);
+      expect(body.title).toBe("");
+      expect(body.description).toBe("");
     });
   });
 
@@ -192,24 +279,15 @@ describe("TracklyClient", () => {
       expect(headers["Authorization"]).toBe("Bearer my-token");
     });
 
-    it("falls back to apikey-login when apiKey and email are set", async () => {
-      const fetchSpy = vi.spyOn(globalThis, "fetch")
-        // login
-        .mockResolvedValueOnce(jsonResponse({ token: "new-token" }))
-        // whoAmI
-        .mockResolvedValueOnce(jsonResponse({ id: "u1" }));
-
+    it("does not fall back to apikey-login when auth mode is bearer", async () => {
       const client = new TracklyClient(makeConfig({
         token: "",
         authMode: "bearer",
         apiKey: "key-123",
         email: "user@test.com",
       }));
-      await client.whoAmI();
 
-      // First call should be login
-      const loginUrl = fetchSpy.mock.calls[0]?.[0] as string;
-      expect(loginUrl).toContain("/api/auth/login/apikey");
+      await expect(client.whoAmI()).rejects.toThrow("Trackly bearer mode requires KANBAN_TOKEN.");
     });
   });
 });

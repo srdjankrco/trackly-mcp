@@ -58,13 +58,39 @@ describe("validateConfig", () => {
   });
 
   it("throws when apikey-login mode is missing TRACKLY_API_KEY", () => {
-    const cfg = loadConfig({ KANBAN_PROJECT_URL: "https://x.com", TRACKLY_AUTH_MODE: "apikey-login" });
+    const cfg = loadConfig({
+      KANBAN_PROJECT_URL: "https://x.com",
+      TRACKLY_AUTH_MODE: "apikey-login",
+      TRACKLY_EMAIL: "user@example.com",
+    });
     expect(() => validateConfig(cfg)).toThrow("TRACKLY_API_KEY is required");
   });
 
+  it("throws when apikey-login mode is missing TRACKLY_EMAIL", () => {
+    const cfg = loadConfig({
+      KANBAN_PROJECT_URL: "https://x.com",
+      TRACKLY_AUTH_MODE: "apikey-login",
+      TRACKLY_API_KEY: "key-123",
+    });
+    expect(() => validateConfig(cfg)).toThrow("TRACKLY_EMAIL is required");
+  });
+
   it("throws when password-login mode is missing TRACKLY_PASSWORD", () => {
-    const cfg = loadConfig({ KANBAN_PROJECT_URL: "https://x.com", TRACKLY_AUTH_MODE: "password-login" });
+    const cfg = loadConfig({
+      KANBAN_PROJECT_URL: "https://x.com",
+      TRACKLY_AUTH_MODE: "password-login",
+      TRACKLY_EMAIL: "user@example.com",
+    });
     expect(() => validateConfig(cfg)).toThrow("TRACKLY_PASSWORD is required");
+  });
+
+  it("throws when password-login mode is missing TRACKLY_EMAIL", () => {
+    const cfg = loadConfig({
+      KANBAN_PROJECT_URL: "https://x.com",
+      TRACKLY_AUTH_MODE: "password-login",
+      TRACKLY_PASSWORD: "secret",
+    });
+    expect(() => validateConfig(cfg)).toThrow("TRACKLY_EMAIL is required");
   });
 
   it("throws when bearer mode is missing KANBAN_TOKEN", () => {
@@ -72,10 +98,31 @@ describe("validateConfig", () => {
     expect(() => validateConfig(cfg)).toThrow("KANBAN_TOKEN is required");
   });
 
+  it("throws when TRACKLY_RATE_LIMIT_MS is invalid", () => {
+    const cfg = loadConfig({
+      KANBAN_PROJECT_URL: "https://x.com",
+      TRACKLY_AUTH_MODE: "bearer",
+      KANBAN_TOKEN: "tok-123",
+      TRACKLY_RATE_LIMIT_MS: "-1",
+    });
+    expect(() => validateConfig(cfg)).toThrow("TRACKLY_RATE_LIMIT_MS must be greater than or equal to 0.");
+  });
+
+  it("throws when TRACKLY_TIMEOUT_MS is not greater than zero", () => {
+    const cfg = loadConfig({
+      KANBAN_PROJECT_URL: "https://x.com",
+      TRACKLY_AUTH_MODE: "bearer",
+      KANBAN_TOKEN: "tok-123",
+      TRACKLY_TIMEOUT_MS: "0",
+    });
+    expect(() => validateConfig(cfg)).toThrow("TRACKLY_TIMEOUT_MS must be greater than 0.");
+  });
+
   it("passes with valid apikey-login config", () => {
     const cfg = loadConfig({
       KANBAN_PROJECT_URL: "https://x.com",
       TRACKLY_AUTH_MODE: "apikey-login",
+      TRACKLY_EMAIL: "user@example.com",
       TRACKLY_API_KEY: "key-123",
     });
     expect(() => validateConfig(cfg)).not.toThrow();

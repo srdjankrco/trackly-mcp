@@ -53,7 +53,7 @@ When `MCP_AUTH_MODE=oauth`, the server can still accept `Authorization: Bearer <
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MCP_HTTP_PORT` | HTTP port (omit or `0` for stdio mode) | — |
-| `MCP_HOST` | Bind address for HTTP mode | `127.0.0.1` |
+| `MCP_HOST` | Bind address for HTTP mode. Use `0.0.0.0` for Docker or reverse-proxy deployments. | `127.0.0.1` |
 | `MCP_AUTH_MODE` | MCP auth: `apikey` or `oauth` | `apikey` |
 | `MCP_API_KEY` | API key for MCP auth in `apikey` mode, or optional fallback credential in `oauth` mode | — |
 | `MCP_MAX_SESSIONS` | Maximum concurrent MCP sessions before LRU eviction | `100` |
@@ -90,6 +90,7 @@ MCP_HTTP_PORT=3000 MCP_AUTH_MODE=apikey MCP_API_KEY=my-secret node dist/mcp-serv
 docker build -t trackly-mcp .
 docker run -p 3000:3000 \
   -e MCP_HTTP_PORT=3000 \
+  -e MCP_HOST=0.0.0.0 \
   -e KANBAN_PROJECT_URL=https://trackly-api.azurewebsites.net \
   -e TRACKLY_AUTH_MODE=apikey-login \
   -e TRACKLY_EMAIL=you@example.com \
@@ -172,6 +173,7 @@ npm run dev         # Run in development mode (stdio)
 
 ### Connection refused / timeout
 - Ensure `MCP_HTTP_PORT` is set to enable HTTP mode
+- In Docker or App Service multi-container deployments, set `MCP_HOST=0.0.0.0` so other containers can reach the MCP server
 - Check the server is listening: `curl http://localhost:3000/health`
 - Verify firewall/network rules if connecting remotely
 

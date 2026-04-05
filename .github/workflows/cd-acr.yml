@@ -7,28 +7,40 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+  id-token: write
+
 concurrency:
   group: cd-acr-${{ github.ref }}
   cancel-in-progress: true
 
 env:
+  REGISTRY_NAME: dunavnet
   REGISTRY: dunavnet.azurecr.io
   IMAGE_NAME: mcp/trackly-mcp
+  AZURE_CLIENT_ID: 8066ae88-684a-4b65-a318-73ce7d212152
+  AZURE_TENANT_ID: a3a630ac-fa20-4e00-baab-ceeede9da950
+  AZURE_SUBSCRIPTION_ID: 8d96c3d5-927c-4539-82a3-29394c9cd800
 
 jobs:
   build-and-push:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
+    environment: acr-publish
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
 
       - name: Log in to Azure Container Registry
-        uses: azure/docker-login@v2
-        with:
-          login-server: ${{ env.REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
+        run: az acr login --name ${{ env.REGISTRY_NAME }}
 
       - name: Extract version tag
         id: meta
